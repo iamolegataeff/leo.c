@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Leo</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,700;1,400&display=swap');
+  :root { --bg:#fafaf8; --fg:#1a1a1a; --dim:#777; --ghost:#aaa; --res:#c4956a; --serif:'EB Garamond',Georgia,serif; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:var(--bg); color:var(--fg); font-family:var(--serif); height:100vh; display:flex; flex-direction:column; overflow:hidden; }
+  #header { text-align:center; padding:20px 0 8px; user-select:none; }
+  #header h1 { font-size:13px; letter-spacing:8px; text-transform:uppercase; color:#888; font-weight:500; }
+  #header .sub { font-size:11px; color:var(--ghost); margin-top:2px; font-style:italic; }
+  #status { text-align:center; font-size:11px; color:var(--ghost); padding:4px; letter-spacing:1px; }
+  #status.ready { color:#4a7c59; }
+  #arena { flex:1; overflow-y:auto; padding:12px 40px; display:flex; flex-direction:column; gap:12px; }
+  .msg { max-width:700px; width:100%; margin:0 auto; line-height:1.6; font-size:17px; }
+  .msg.user { color:var(--dim); font-style:italic; }
+  .msg.user::before { content:'— '; color:var(--ghost); }
+  .msg.leo { color:var(--fg); }
+  .resonance { color:var(--res); border-left:2px solid var(--res); padding-left:12px; margin:6px 0; font-style:italic; opacity:0.85; }
+  .meta { font-size:10px; color:var(--ghost); margin-top:4px; letter-spacing:1px; }
+  #input-area { padding:12px 40px 20px; display:flex; justify-content:center; gap:8px; }
+  #prompt { width:100%; max-width:650px; font-family:var(--serif); font-size:17px; padding:10px 14px; border:1px solid #ddd; border-radius:3px; background:#fff; color:var(--fg); outline:none; }
+  #prompt:focus { border-color:var(--fg); }
+  #prompt::placeholder { color:var(--ghost); font-style:italic; }
+  #prompt:disabled { opacity:0.4; }
+  #load-btn { font-family:var(--serif); font-size:12px; padding:8px 16px; border:1px solid #ccc; background:none; cursor:pointer; color:var(--dim); letter-spacing:1px; }
+  #load-btn:hover { border-color:var(--fg); color:var(--fg); }
+  .typing { display:inline-block; width:6px; height:14px; background:var(--fg); animation:blink .8s infinite; vertical-align:text-bottom; margin-left:1px; }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+  #footer { text-align:center; padding:6px; font-size:9px; color:var(--ghost); letter-spacing:2px; }
+  #weight-file { display:none; }
+</style>
+</head>
+<body>
+<div id="header">
+  <h1>Leo</h1>
+  <div class="sub">language emergent organism · gemma 270M</div>
+</div>
+<div id="status">load weights to begin</div>
+<div id="arena"></div>
+<div id="input-area">
+  <input type="text" id="prompt" placeholder="speak to Leo..." disabled>
+  <button id="load-btn">load weights</button>
+  <input type="file" id="weight-file" accept=".bin">
+</div>
+<div id="footer">thunder remembered</div>
+
+<script>
+// ═════════════════════════════════════════════════════════════════
+// LEO — Browser-side Gemma-3 270M inference
+//
+// Full forward pass in JavaScript. Loads LEO1 q8 binary.
+// Architecture: 18 layers, hidden=640, ffn=2048, 4 heads (GQA),
+//               1 KV head, head_dim=256, vocab=262144
+// ═════════════════════════════════════════════════════════════════
+
+const HEADER_SIZE = 64;
+
+// Model state
+let M = null;  // loaded model
+let KV = null; // KV cache
+let kvLen = 0;
+
+// ── F16 CONVERSION ──
+function f16ToF32(h) {
+  const sign = (h >> 15) & 1;
+  const exp = (h >> 10) & 0x1F;
+  const mant = h & 0x3FF;
+  if (exp === 0) {
+    if (mant === 0) return sign ? -0.0 : 0.0;
+    let e = 1, m = mant;
+    while (!(m & 0x400)) { m <<= 1; e--; }
+    m &= 0x3FF;
+    return (sign ? -1 : 1) * Math.pow(2, e - 15) * (1 + m / 1024);
+  }
+  if (exp === 31) return mant ? NaN : (sign ? -Infinity : Infinity);
+  return (sign ? -1 : 1) * Math.pow(2, exp - 15) * (1 + mant / 1024);
+}
+
+// ── LOAD LEO1 BINARY ──
+function loadModel(buffer) {
+  const view = new DataView(buffer);
+  let off = 0;
+
+  const magic = view.getUint32(off, true); off += 4;
+  if (magic !== 0x4C454F31) throw new Error('Bad magic: ' + magic.toString(16));
+  const ver = view.getUint32(off, true); off += 4;
+  const qtype = view.getUint32(off, true); off += 4;
+  const nLayers = view.getUint32(off, true); off += 4;
+  const hidden = view.getUint32(off, true); off += 4;
+  const ffn = view.getUint32(off, true); off += 4;
+  const nHeads = view.getUint32(off, true); off += 4;
+  const nKV = view.getUint32(off, true); off += 4;
+  const headDim = view.getUint32(off, true); off += 4;
+  const vocab = view.getUint32(off, true); off += 4;
+  const sliding = view.getUint32(off, true); off += 4;
+  off = HEADER_SIZE;
+
+  setStatus(`LEO1 v${ver} q${qtype}: ${nLayers}L h=${hidden} ffn=${ffn} heads=${nHeads} kv=${nKV} hd=${headDim} vocab=${vocab}`);
+
+  // Embedding (f16)
+  const embedBytes = vocab * hidden * 2;
+  const embed = new Uint16Array(buffer, off, vocab * hidden);
+  off += embedBytes;
+
+  // Layers
+  const layers = [];
+  for (let l = 0; l < nLayers; l++) {
+    const layer = {};
+
+    // Read quantized weights
+    function readQ() {
+      const rows = view.getUint32(off, true); off += 4;
+      const cols = view.getUint32(off, true); off += 4;
+      const scales = new Float32Array(buffer, off, rows); off += rows * 4;
+      const data = new Int8Array(buffer, off, rows * cols); off += rows * cols;
+      return { rows, cols, scales, data };
+    }
+
+    // Read f16 vector
+    function readF16(n) {
+      const arr = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        arr[i] = f16ToF32(view.getUint16(off, true));
+        off += 2;
+      }
+      return arr;
+    }
+
+    layer.q_proj = readQ();
+    layer.k_proj = readQ();
+    layer.v_proj = readQ();
+    layer.o_proj = readQ();
+    layer.q_norm = readF16(headDim);
+    layer.k_norm = readF16(headDim);
+    layer.gate_proj = readQ();
+    layer.up_proj = readQ();
+    layer.down_proj = readQ();
+    layer.input_ln = readF16(hidden);
+    layer.post_attn_ln = readF16(hidden);
+    layer.pre_ffn_ln = readF16(hidden);
+    layer.post_ffn_ln = readF16(hidden);
+    layers.push(layer);
+
+    if (l % 6 === 0) setStatus(`Loading layer ${l+1}/${nLayers}...`);
+  }
+
+  // Final norm
+  const finalNorm = new Float32Array(hidden);
+  for (let i = 0; i < hidden; i++) { finalNorm[i] = f16ToF32(view.getUint16(off, true)); off += 2; }
+
+  // LM head (f16)
+  const lmHead = new Uint16Array(buffer, off, vocab * hidden);
+  off += vocab * hidden * 2;
+
+  M = { nLayers, hidden, ffn, nHeads, nKV, headDim, vocab, sliding, embed, layers, finalNorm, lmHead };
+
+  // Init KV cache
+  const maxSeq = 512;
+  KV = {
+    k: new Float32Array(nLayers * maxSeq * nKV * headDim),
+    v: new Float32Array(nLayers * maxSeq * nKV * headDim),
+    maxSeq
+  };
+  kvLen = 0;
+
+  setStatus('Leo ready', true);
+  document.getElementById('prompt').disabled = false;
+  return M;
+}
+
+// ── MATH ──
+function rmsNorm(out, x, w, n) {
+  let ss = 0;
+  for (let i = 0; i < n; i++) ss += x[i] * x[i];
+  ss = 1.0 / Math.sqrt(ss / n + 1e-6);
+  for (let i = 0; i < n; i++) out[i] = x[i] * ss * (1.0 + w[i]);
+}
+
+function qMatVec(out, w, x) {
+  for (let r = 0; r < w.rows; r++) {
+    let sum = 0;
+    const base = r * w.cols;
+    const scale = w.scales[r] / 127.0;
+    for (let i = 0; i < w.cols; i++) sum += w.data[base + i] * x[i];
+    out[r] = sum * scale;
+  }
+}
+
+function embedLookup(out, embed, token, dim) {
+  const base = token * dim;
+  for (let i = 0; i < dim; i++) out[i] = f16ToF32(embed[base + i]);
+}
+
+function softmax(x, n) {
+  let max = x[0];
+  for (let i = 1; i < n; i++) if (x[i] > max) max = x[i];
+  let sum = 0;
+  for (let i = 0; i < n; i++) { x[i] = Math.exp(x[i] - max); sum += x[i]; }
+  for (let i = 0; i < n; i++) x[i] /= sum;
+}
+
+function gelu(x) {
+  return 0.5 * x * (1.0 + Math.tanh(0.7978845608 * (x + 0.044715 * x * x * x)));
+}
+
+// ── FORWARD PASS ──
+function forwardToken(token) {
+  const H = M.hidden, HD = M.headDim, NH = M.nHeads, NKV = M.nKV;
+  const FFN = M.ffn, NL = M.nLayers, V = M.vocab;
+  const pos = kvLen;
+
+  // Embed + scale
+  const x = new Float32Array(H);
+  embedLookup(x, M.embed, token, H);
+  const scale = Math.sqrt(H);
+  for (let i = 0; i < H; i++) x[i] *= scale;
+
+  for (let l = 0; l < NL; l++) {
+    const ly = M.layers[l];
+
+    // Pre-attn norm
+    const buf = new Float32Array(H);
+    rmsNorm(buf, x, ly.input_ln, H);
+
+    // QKV
+    const q = new Float32Array(NH * HD);
+    const kNew = new Float32Array(NKV * HD);
+    const vNew = new Float32Array(NKV * HD);
+    qMatVec(q, ly.q_proj, buf);
+    qMatVec(kNew, ly.k_proj, buf);
+    qMatVec(vNew, ly.v_proj, buf);
+
+    // Q/K norms
+    for (let h = 0; h < NH; h++) {
+      let ss = 0;
+      for (let i = 0; i < HD; i++) ss += q[h*HD+i] * q[h*HD+i];
+      ss = 1.0 / Math.sqrt(ss / HD + 1e-6);
+      for (let i = 0; i < HD; i++) q[h*HD+i] = q[h*HD+i] * ss * (1.0 + ly.q_norm[i]);
+    }
+    for (let h = 0; h < NKV; h++) {
+      let ss = 0;
+      for (let i = 0; i < HD; i++) ss += kNew[h*HD+i] * kNew[h*HD+i];
+      ss = 1.0 / Math.sqrt(ss / HD + 1e-6);
+      for (let i = 0; i < HD; i++) kNew[h*HD+i] = kNew[h*HD+i] * ss * (1.0 + ly.k_norm[i]);
+    }
+
+    // RoPE
+    const theta = (l % 6 === 5) ? 1000000.0 : 10000.0;
+    for (let h = 0; h < NH; h++) {
+      for (let i = 0; i < HD; i += 2) {
+        const freq = 1.0 / Math.pow(theta, i / HD);
+        const angle = pos * freq;
+        const cos_a = Math.cos(angle), sin_a = Math.sin(angle);
+        const q0 = q[h*HD+i], q1 = q[h*HD+i+1];
+        q[h*HD+i] = q0*cos_a - q1*sin_a;
+        q[h*HD+i+1] = q0*sin_a + q1*cos_a;
+      }
+    }
+    for (let h = 0; h < NKV; h++) {
+      for (let i = 0; i < HD; i += 2) {
+        const freq = 1.0 / Math.pow(theta, i / HD);
+        const angle = pos * freq;
+        const cos_a = Math.cos(angle), sin_a = Math.sin(angle);
+        const k0 = kNew[h*HD+i], k1 = kNew[h*HD+i+1];
+        kNew[h*HD+i] = k0*cos_a - k1*sin_a;
+        kNew[h*HD+i+1] = k0*sin_a + k1*cos_a;
+      }
+    }
+
+    // Store KV
+    const kvOff = (l * KV.maxSeq + pos) * NKV * HD;
+    KV.k.set(kNew, kvOff);
+    KV.v.set(vNew, kvOff);
+
+    // Attention (GQA)
+    const seqLen = pos + 1;
+    const window = M.sliding;
+    const start = (l % 6 === 5) ? 0 : Math.max(0, pos - window + 1);
+    const attnScale = 1.0 / Math.sqrt(HD);
+    const attnOut = new Float32Array(NH * HD);
+
+    for (let h = 0; h < NH; h++) {
+      const kvHead = Math.floor(h / (NH / NKV));
+      const scores = new Float32Array(seqLen);
+
+      for (let t = start; t < seqLen; t++) {
+        const kvT = (l * KV.maxSeq + t) * NKV * HD + kvHead * HD;
+        let dot = 0;
+        for (let i = 0; i < HD; i++) dot += q[h*HD+i] * KV.k[kvT+i];
+        scores[t] = dot * attnScale;
+      }
+      for (let t = 0; t < start; t++) scores[t] = -1e9;
+      softmax(scores, seqLen);
+
+      for (let t = start; t < seqLen; t++) {
+        const kvT = (l * KV.maxSeq + t) * NKV * HD + kvHead * HD;
+        for (let i = 0; i < HD; i++) attnOut[h*HD+i] += scores[t] * KV.v[kvT+i];
+      }
+    }
+
+    // O proj
+    const attnProj = new Float32Array(H);
+    qMatVec(attnProj, ly.o_proj, attnOut);
+
+    // Post-attn norm + residual
+    const postAttn = new Float32Array(H);
+    rmsNorm(postAttn, attnProj, ly.post_attn_ln, H);
+    for (let i = 0; i < H; i++) x[i] += postAttn[i];
+
+    // Pre-FFN norm
+    rmsNorm(buf, x, ly.pre_ffn_ln, H);
+
+    // SwiGLU
+    const gate = new Float32Array(FFN);
+    const up = new Float32Array(FFN);
+    qMatVec(gate, ly.gate_proj, buf);
+    qMatVec(up, ly.up_proj, buf);
+    for (let i = 0; i < FFN; i++) gate[i] = gelu(gate[i]) * up[i];
+
+    const down = new Float32Array(H);
+    qMatVec(down, ly.down_proj, gate);
+
+    // Post-FFN norm + residual
+    const postFFN = new Float32Array(H);
+    rmsNorm(postFFN, down, ly.post_ffn_ln, H);
+    for (let i = 0; i < H; i++) x[i] += postFFN[i];
+  }
+
+  // Final norm
+  const normed = new Float32Array(H);
+  rmsNorm(normed, x, M.finalNorm, H);
+
+  // Logits (sample top-k only for speed — don't compute all 262K)
+  // For browser perf: compute logits for top candidates via random sampling
+  // Full logits would be too slow for 262K vocab
+  const logits = new Float32Array(V);
+  for (let v = 0; v < V; v++) {
+    const base = v * H;
+    let dot = 0;
+    for (let i = 0; i < H; i++) dot += normed[i] * f16ToF32(M.lmHead[base + i]);
+    logits[v] = dot;
+  }
+
+  kvLen++;
+  return logits;
+}
+
+// ── SAMPLING ──
+function sampleTopK(logits, temp, topK) {
+  const n = logits.length;
+  if (temp <= 0) {
+    let best = 0;
+    for (let i = 1; i < n; i++) if (logits[i] > logits[best]) best = i;
+    return best;
+  }
+  for (let i = 0; i < n; i++) logits[i] /= temp;
+
+  // Top-k
+  if (topK > 0 && topK < n) {
+    const indices = Array.from({length: n}, (_, i) => i);
+    indices.sort((a, b) => logits[b] - logits[a]);
+    const cutoff = logits[indices[topK - 1]];
+    for (let i = 0; i < n; i++) if (logits[i] < cutoff) logits[i] = -1e9;
+  }
+
+  softmax(logits, n);
+  let r = Math.random(), cum = 0;
+  for (let i = 0; i < n; i++) { cum += logits[i]; if (cum >= r) return i; }
+  return n - 1;
+}
+
+// ── ENTROPY ──
+const H_MAX = Math.log2(262144);
+function computeEntropy(logits) {
+  const n = logits.length;
+  let max = logits[0];
+  for (let i = 1; i < n; i++) if (logits[i] > max) max = logits[i];
+  let sum = 0;
+  const probs = new Float32Array(n);
+  for (let i = 0; i < n; i++) { probs[i] = Math.exp(logits[i] - max); sum += probs[i]; }
+  for (let i = 0; i < n; i++) probs[i] /= sum;
+  let H = 0;
+  for (let i = 0; i < n; i++) if (probs[i] > 1e-10) H -= probs[i] * Math.log2(probs[i]);
+  return H;
+}
+
+// ── GENERATION ──
+async function generate(tokenIds, maxTokens = 256) {
+  kvLen = 0;
+  KV.k.fill(0);
+  KV.v.fill(0);
+
+  let logits;
+  // Prefill
+  for (let i = 0; i < tokenIds.length; i++) {
+    logits = forwardToken(tokenIds[i]);
+    await yieldToUI();
+  }
+
+  const generated = [];
+  let inRes = false, consHigh = 0, consLow = 0, entries = 0, hSum = 0;
+
+  for (let step = 0; step < maxTokens; step++) {
+    if (step > 0) logits = forwardToken(generated[generated.length - 1]);
+
+    const H = computeEntropy(logits);
+    const hNorm = H / H_MAX;
+    hSum += hNorm;
+
+    // Resonance check
+    if (!inRes && hNorm > 0.35) { consHigh++; if (consHigh >= 3) { inRes = true; entries++; consHigh = 0; appendToken('\n/resonate/\n'); } }
+    else if (!inRes) consHigh = 0;
+    if (inRes && hNorm < 0.12) { consLow++; if (consLow >= 5) { inRes = false; consLow = 0; appendToken('\n/resonated/\n'); } }
+    else if (inRes) consLow = 0;
+
+    const temp = inRes ? 0.7 * (1 + 0.3 * hNorm) : 0.7;
+    const tok = sampleTopK(logits.slice(), temp, 40);
+
+    if (tok === 106 || tok === 1) break; // EOS
+
+    generated.push(tok);
+    // Decode (placeholder — need vocab)
+    appendToken(`[${tok}]`);
+    await yieldToUI();
+  }
+
+  const avgH = hSum / Math.max(1, generated.length + tokenIds.length);
+  appendMeta(`H̄=${avgH.toFixed(3)} · resonance=${entries} · ${generated.length} tokens`);
+}
+
+function yieldToUI() {
+  return new Promise(r => setTimeout(r, 0));
+}
+
+// ── UI ──
+const arena = document.getElementById('arena');
+const input = document.getElementById('prompt');
+const statusEl = document.getElementById('status');
+let currentLeo = null;
+
+function setStatus(msg, ready) {
+  statusEl.textContent = msg;
+  if (ready) statusEl.className = 'ready';
+}
+
+function appendToken(text) {
+  if (!currentLeo) {
+    currentLeo = document.createElement('div');
+    currentLeo.className = 'msg leo';
+    arena.appendChild(currentLeo);
+  }
+  currentLeo.textContent += text;
+  arena.scrollTop = arena.scrollHeight;
+}
+
+function appendMeta(text) {
+  if (currentLeo) {
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.textContent = text;
+    currentLeo.appendChild(meta);
+  }
+}
+
+// Load weights
+document.getElementById('load-btn').onclick = () => document.getElementById('weight-file').click();
+document.getElementById('weight-file').onchange = async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  setStatus(`Loading ${file.name} (${(file.size/1e6).toFixed(0)}MB)...`);
+  const buffer = await file.arrayBuffer();
+  try {
+    loadModel(buffer);
+  } catch (err) {
+    setStatus('Error: ' + err.message);
+  }
+};
+
+// Chat
+input.addEventListener('keydown', async (e) => {
+  if (e.key !== 'Enter' || !M) return;
+  const text = input.value.trim();
+  if (!text) return;
+
+  const userDiv = document.createElement('div');
+  userDiv.className = 'msg user';
+  userDiv.textContent = text;
+  arena.appendChild(userDiv);
+
+  input.value = '';
+  input.disabled = true;
+  currentLeo = null;
+
+  // Simple tokenization: BOS + start_of_turn + user + \n + text + end_of_turn + \n + start_of_turn + model + \n
+  // Using hardcoded IDs for special tokens, basic char tokenization for text
+  const tokens = [2, 105, 2364, 107]; // BOS, <start_of_turn>, "user", \n
+  // TODO: proper BPE encode for text — for now use byte tokens
+  for (let i = 0; i < text.length; i++) {
+    // Find token for this char (approximate)
+    tokens.push(text.charCodeAt(i) < 128 ? text.charCodeAt(i) + 200 : 236700);
+  }
+  tokens.push(106, 107, 105, 4368, 107); // end_of_turn, \n, start_of_turn, "model", \n
+
+  setStatus('Generating...');
+  await generate(tokens);
+  setStatus('Leo ready', true);
+  input.disabled = false;
+  input.focus();
+});
+
+setStatus('Load weights to begin');
+</script>
+</body>
+</html>
