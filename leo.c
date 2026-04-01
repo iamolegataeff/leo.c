@@ -562,6 +562,9 @@ static void forward_layer(Model *m, int l, float *x, KVCache *kv, int pos) {
 
     if (l == 0) {
         fprintf(stderr, "DBG L0 input[:4]: %.4f %.4f %.4f %.4f\n", x[0], x[1], x[2], x[3]);
+        fprintf(stderr, "DBG L0 input[636:640]: %.4f %.4f %.4f %.4f\n", x[636], x[637], x[638], x[639]);
+        double dbg_ss = 0; for (int i = 0; i < H; i++) dbg_ss += (double)x[i]*(double)x[i];
+        fprintf(stderr, "DBG L0 ss=%.10f  1/sqrt=%.10f\n", dbg_ss/H, 1.0/sqrt(dbg_ss/H + 1e-6));
         fprintf(stderr, "DBG L0 normed[:4]: %.4f %.4f %.4f %.4f\n", buf[0], buf[1], buf[2], buf[3]);
     }
 
