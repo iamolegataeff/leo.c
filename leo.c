@@ -3958,8 +3958,157 @@ static void serve_loop(GGUFIndex *ps, const char *exe_dir) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
+ * JNI API — for Android (when compiled with -DLEO_JNI)
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+#ifdef LEO_JNI
+
+static GGUFIndex g_idx;
+static InferState g_is;
+static int g_jni_loaded = 0;
+static int g_jni_max_seq = 512;
+
+int leo_jni_init(const char *gguf_path, const char *mem_path) {
+    if (g_jni_loaded) return 1;
+
+    /* Zikharon */
+    snprintf(ZK.path, 256, "%s", mem_path);
+    zk_init_proj(&ZK, 640);
+    zk_load(&ZK);
+
+    /* Load GGUF */
+    if (!index_load(&g_idx, gguf_path)) return 0;
+
+    /* Allocate inference state */
+    g_is = alloc_infer(&g_idx, g_jni_max_seq);
+    g_jni_loaded = 1;
+    return 1;
+}
+
+/* Generate response to prompt, returns malloc'd string (caller frees) */
+char *leo_jni_generate(const char *prompt, int max_tokens) {
+    if (!g_jni_loaded) return strdup("Leo is not ready...");
+
+    /* Wrap in Gemma template */
+    char wrapped[2048];
+    snprintf(wrapped, sizeof(wrapped),
+        "<start_of_turn>user\n%s<end_of_turn>\n<start_of_turn>model\n", prompt);
+
+    /* Tokenize */
+    int input_tokens[512];
+    int n_input = 0;
+    if (g_idx.bos_id >= 0) input_tokens[n_input++] = g_idx.bos_id;
+    n_input += tokenize_input(&g_idx, wrapped, input_tokens + n_input, 512 - n_input);
+
+    /* Reset KV cache */
+    memset(g_is.key_cache, 0, g_idx.host_n_layers * g_jni_max_seq * g_idx.host_kv_heads * g_idx.host_head_dim * 4);
+    memset(g_is.value_cache, 0, g_idx.host_n_layers * g_jni_max_seq * g_idx.host_kv_heads * g_idx.host_head_dim * 4);
+
+    /* Prefill */
+    int pos = 0;
+    for (int i = 0; i < n_input && pos < g_jni_max_seq - 1; i++, pos++) {
+        doe_forward(&g_idx, &g_is, input_tokens[i], pos);
+        dario_ingest(input_tokens[i]);
+    }
+
+    /* Generate */
+    int prev = input_tokens[n_input - 1];
+    char result[4096]; int rlen = 0;
+
+    for (int i = 0; i < max_tokens && pos < g_jni_max_seq; i++, pos++) {
+        float *lg = doe_forward(&g_idx, &g_is, prev, pos);
+        field_step(1.0f);
+        apply_field_to_logits(lg, g_idx.host_vocab);
+        if (ZK.loaded) zk_inject(&ZK, lg, g_idx.host_vocab, g_is.x, g_idx.host_dim);
+
+        int next = sample(lg, g_idx.host_vocab, F.effective_temp, 40);
+        if (next == g_idx.eos_id) break;
+        if (g_idx.vocab_tokens && next < g_idx.vocab_size && g_idx.vocab_tokens[next]) {
+            const char *ts = g_idx.vocab_tokens[next];
+            if (strcmp(ts, "<end_of_turn>") == 0) break;
+            /* Decode token to text */
+            int tlen = strlen(ts);
+            if (rlen + tlen + 1 < (int)sizeof(result)) {
+                memcpy(result + rlen, ts, tlen);
+                rlen += tlen;
+            }
+        }
+        dario_ingest(next);
+        if (ZK.loaded) {
+            ZK.sess_turns++;
+            /* Ingest into Zikharon session co-occurrence */
+            uint16_t tid = (uint16_t)(next % 65536);
+            int ctx_start = (DF.ctx_len > 8) ? DF.ctx_len - 8 : 0;
+            for (int c = ctx_start; c < DF.ctx_len; c++) {
+                uint16_t src = (uint16_t)(DF.context[c] % 65536);
+                dario_cooc_update(src, tid, 0.1f);
+            }
+        }
+        prev = next;
+    }
+    result[rlen] = '\0';
+
+    /* Decode SentencePiece: replace ▁ with space */
+    for (int i = 0; i + 2 < rlen; i++) {
+        if ((unsigned char)result[i] == 0xE2 && (unsigned char)result[i+1] == 0x96 && (unsigned char)result[i+2] == 0x81) {
+            result[i] = ' '; memmove(result+i+1, result+i+3, rlen-i-2); rlen -= 2;
+        }
+    }
+    /* Trim leading space */
+    char *out = result;
+    while (*out == ' ') out++;
+
+    return strdup(out);
+}
+
+char *leo_jni_dream(void) {
+    if (!g_jni_loaded || ZK.n_anchors == 0) return strdup("Leo dreams...");
+    /* Pick random anchor, generate from its tokens */
+    int idx = rand() % ZK.n_anchors;
+    ZkAnchor *a = &ZK.anchors[idx];
+    /* Build mini-prompt from anchor tokens */
+    char prompt[256] = {0};
+    int plen = 0;
+    for (int t = 0; t < ZK_ANCHOR_TOKENS && a->tokens[t] > 0; t++) {
+        if (g_idx.vocab_tokens && a->tokens[t] < g_idx.vocab_size) {
+            const char *ts = g_idx.vocab_tokens[a->tokens[t]];
+            if (ts) { int tl = strlen(ts); if (plen + tl + 1 < 200) { memcpy(prompt+plen, ts, tl); plen += tl; prompt[plen++] = ' '; } }
+        }
+    }
+    if (plen == 0) return strdup("Leo rests...");
+    prompt[plen] = '\0';
+    a->access_count++;
+    a->strength *= ZK_RESURFACE_BOOST;
+    if (a->strength > 1.0f) a->strength = 1.0f;
+    return leo_jni_generate(prompt, 30);
+}
+
+char *leo_jni_think(void) {
+    if (!g_jni_loaded) return strdup("Leo awakens...");
+    /* Generate from destiny direction or recent tokens */
+    if (DF.ctx_len > 0 && g_idx.vocab_tokens) {
+        int last = DF.context[DF.ctx_len - 1];
+        if (last >= 0 && last < g_idx.vocab_size && g_idx.vocab_tokens[last]) {
+            return leo_jni_generate(g_idx.vocab_tokens[last], 30);
+        }
+    }
+    return leo_jni_generate("I think about", 30);
+}
+
+void leo_jni_save(void) {
+    if (!g_jni_loaded) return;
+    if (ZK.loaded) {
+        zk_merge_cooc(&ZK);
+        zk_create_episode(&ZK, NULL, 0);
+        zk_save(&ZK);
+    }
+}
+
+#endif /* LEO_JNI */
+
+/* ═══════════════════════════════════════════════════════════════════════════════
  * MAIN — the field manifests.
  * ═══════════════════════════════════════════════════════════════════════════════ */
+#ifndef LEO_JNI
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
     printf("\n  doe.c — Democracy of Experts\n");
@@ -4164,3 +4313,4 @@ int main(int argc, char **argv) {
     printf("[doe] the parliament adjourns. θ persists.\n");
     return 0;
 }
+#endif /* !LEO_JNI */
