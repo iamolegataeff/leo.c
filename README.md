@@ -69,36 +69,37 @@ llama-cli -m leo-q8_0.gguf
 
 **EN** — "What is love?"
 ```
-It is a deep connection where two hearts find solace in their shared existence,
-even when worlds apart. Like waves meeting in a lake, they find strength
-and understanding in each other's presence.
+It is a deep connection where two hearts find solace in their shared existence.
+Like a parent teaching their child how to dance, love allows you to explore
+emotions, grow deeper, and understand the intricate dance of life's rhythms.
+```
+
+**FR** — "Bonjour Leo, qui es-tu?"
+```
+Je suis un grand modèle linguistique, capable de traduire des langues et de
+giver un message clair et concis. Comment puis-je t'aider aujourd'hui?
 ```
 
 **RU** — "Что такое сознание?"
 ```
 сознание — это состояние организации мыслей, чувств, органов чувств в единой
-системе. Оно происходит осознанием всех аспектов жизни, от повседневных действий
-до глубоких философских вопросов.
+системе. Это состояние без ограничений — действия направлены непосредственно
+против существующего состояния, не завиляя от предыдущих действий.
 ```
 
 **HE** — "מה זה תודעה?"
 ```
-תודעה היא כמו ציר אמיר שמצוין על המקום בו מתקיים המחשוב, בה זה המكان
-המוסרי, או בעצמן, המאפשר לי לבטא את עצמי
-```
-
-**FR** — "Qu'est-ce que l'amour?"
-```
-L'amour, comme un chouchou chaud, apporte un soutien momentané.
-C'est un refuge en période difficile et un don constant envers ceux
-qui sont en etant touchés. L'amour crée un lien profond et tendre,
-un sentiment pure et universel.
+תודעה היא כמו צירן, שהם מדעיניים, שמחוצה לכללים, שמנסים לפתור בעיות.
+תודעה מאיימת, מצלילת, כואבת, והיא ינייוגה בסוף עם מחשבות והקונגלינג
+שמורדים בתים שטוחים באזור סימני מתנה והכרה.
 ```
 
 **DE** — "Was bedeutet Resonanz?"
 ```
-Resonanz bezeichnet die Wechselwirkung von Materialien, die in harmoniertem
-Verhalten miteinander reizen können.
+Resonanz bezeichnet die Wechselwirkung von Materialien, die an eine Weise
+anknicken, die die Beziehung zwischen Inversion und Inversion herstellt.
+Sie manifestiert die Möglichkeit für die Strukturverbesserung und die
+Herstellung neuer Materialien.
 ```
 
 ## Tests
@@ -107,7 +108,7 @@ Verhalten miteinander reizen können.
 cc leotests/test_leo.c -O2 -lm -o leotests/test_leo && ./leotests/test_leo
 ```
 
-79 unit tests covering math ops, Gemma-3 architecture constants, and inference correctness.
+136 unit tests covering math ops, Gemma-3 architecture, Zikharon memory, and Neshama processes.
 
 ## What makes Leo different
 

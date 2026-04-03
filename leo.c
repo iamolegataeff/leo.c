@@ -417,6 +417,101 @@ typedef struct {
 
 static Zikharon ZK;
 
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * SCRIPT FILTER — suppress foreign Unicode scripts in generation
+ *
+ * Detects dominant script of prompt (Hebrew, Latin, Cyrillic, etc.)
+ * and penalizes tokens containing characters from alien scripts.
+ * Prevents Hebrew/Arabic/Greek/Korean mixing in output.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+enum { SCRIPT_LATIN=0, SCRIPT_HEBREW, SCRIPT_ARABIC, SCRIPT_CYRILLIC, SCRIPT_CJK, SCRIPT_OTHER };
+
+static int detect_codepoint_script(uint32_t cp) {
+    if (cp < 0x80) return SCRIPT_LATIN;
+    if (cp >= 0x00C0 && cp <= 0x024F) return SCRIPT_LATIN;    /* Latin Extended */
+    if (cp >= 0x0590 && cp <= 0x05FF) return SCRIPT_HEBREW;
+    if (cp >= 0xFB1D && cp <= 0xFB4F) return SCRIPT_HEBREW;   /* Hebrew Presentation */
+    if (cp >= 0x0600 && cp <= 0x06FF) return SCRIPT_ARABIC;
+    if (cp >= 0x0750 && cp <= 0x077F) return SCRIPT_ARABIC;    /* Arabic Supplement */
+    if (cp >= 0xFB50 && cp <= 0xFDFF) return SCRIPT_ARABIC;    /* Arabic Presentation A */
+    if (cp >= 0xFE70 && cp <= 0xFEFF) return SCRIPT_ARABIC;    /* Arabic Presentation B */
+    if (cp >= 0x0400 && cp <= 0x04FF) return SCRIPT_CYRILLIC;
+    if (cp >= 0x0500 && cp <= 0x052F) return SCRIPT_CYRILLIC;  /* Cyrillic Supplement */
+    if (cp >= 0x3000 && cp <= 0x9FFF) return SCRIPT_CJK;
+    if (cp >= 0xAC00 && cp <= 0xD7AF) return SCRIPT_CJK;       /* Korean Hangul */
+    if (cp >= 0x0370 && cp <= 0x03FF) return SCRIPT_OTHER;      /* Greek */
+    if (cp >= 0x0E00 && cp <= 0x0E7F) return SCRIPT_OTHER;      /* Thai */
+    if (cp >= 0x1E00 && cp <= 0x1EFF) return SCRIPT_OTHER;      /* Vietnamese */
+    return SCRIPT_OTHER;
+}
+
+/* Decode UTF-8 byte to codepoint, advance pointer. Returns 0 on error. */
+static uint32_t utf8_decode(const char **s) {
+    const unsigned char *p = (const unsigned char *)*s;
+    uint32_t cp;
+    if (p[0] < 0x80) { cp = p[0]; *s += 1; }
+    else if ((p[0] & 0xE0) == 0xC0) { cp = ((p[0]&0x1F)<<6)|(p[1]&0x3F); *s += 2; }
+    else if ((p[0] & 0xF0) == 0xE0) { cp = ((p[0]&0x0F)<<12)|((p[1]&0x3F)<<6)|(p[2]&0x3F); *s += 3; }
+    else if ((p[0] & 0xF8) == 0xF0) { cp = ((p[0]&0x07)<<18)|((p[1]&0x3F)<<12)|((p[2]&0x3F)<<6)|(p[3]&0x3F); *s += 4; }
+    else { *s += 1; return 0; }
+    return cp;
+}
+
+/* Detect dominant non-Latin script in text */
+static int detect_prompt_script(const char *text) {
+    int counts[6] = {0};
+    const char *p = text;
+    while (*p) {
+        uint32_t cp = utf8_decode(&p);
+        if (cp > 0x7F) counts[detect_codepoint_script(cp)]++;
+    }
+    /* Find dominant non-Latin script */
+    int best = SCRIPT_LATIN, best_count = 0;
+    for (int i = 1; i < 6; i++) {
+        if (counts[i] > best_count) { best_count = counts[i]; best = i; }
+    }
+    return best_count > 0 ? best : SCRIPT_LATIN;
+}
+
+/* Check if token contains characters from a forbidden script.
+   Returns 0 (clean), 1 (has some foreign), 2 (predominantly foreign). */
+static int token_foreign_level(const char *tok, int allowed_script) {
+    if (allowed_script == SCRIPT_LATIN) return 0;
+    int total = 0, foreign = 0;
+    const char *p = tok;
+    while (*p) {
+        uint32_t cp = utf8_decode(&p);
+        if (cp < 0x80) continue;  /* ASCII always OK */
+        total++;
+        int sc = detect_codepoint_script(cp);
+        if (sc != allowed_script && sc != SCRIPT_LATIN) {
+            if (allowed_script == SCRIPT_HEBREW) { foreign++; continue; }
+            if (allowed_script == SCRIPT_ARABIC && sc == SCRIPT_HEBREW) { foreign++; continue; }
+            if (allowed_script == SCRIPT_CYRILLIC && sc != SCRIPT_OTHER) { foreign++; continue; }
+            if (sc == SCRIPT_CJK && allowed_script != SCRIPT_CJK) { foreign++; continue; }
+        }
+    }
+    if (foreign == 0) return 0;
+    if (total > 0 && foreign >= total) return 2;  /* all non-ASCII chars are foreign */
+    return 1;
+}
+
+/* Suppress logits for tokens with foreign scripts.
+   Predominantly foreign: heavy penalty. Mixed: lighter penalty. */
+static void apply_script_filter(float *logits, int V, int allowed_script,
+                                  char **vocab_tokens, int vocab_size) {
+    if (allowed_script == SCRIPT_LATIN || !vocab_tokens) return;
+    for (int i = 0; i < V && i < vocab_size; i++) {
+        if (!vocab_tokens[i]) continue;
+        int level = token_foreign_level(vocab_tokens[i], allowed_script);
+        if (level == 2) logits[i] -= 30.0f;       /* purely foreign token */
+        else if (level == 1) logits[i] -= 8.0f;    /* mixed — mild penalty */
+    }
+}
+
+static int g_prompt_script = SCRIPT_LATIN;  /* detected once per turn */
+
 /* ── Zikharon helpers ── */
 
 static void zk_init_proj(Zikharon *zk, int host_dim) {
@@ -3500,6 +3595,9 @@ static void chat(GGUFIndex *ps) {
         if (ps->bos_id >= 0) input_tokens[n_input++] = ps->bos_id;
         n_input += tokenize_input(ps, wrapped, input_tokens + n_input, 512 - n_input);
 
+        /* Detect prompt script for foreign character suppression */
+        g_prompt_script = detect_prompt_script(input);
+
         int pos = 0;
         for (int i = 0; i < n_input && pos < max_seq - 1; i++, pos++) {
             doe_forward(ps, &is, input_tokens[i], pos);
@@ -3520,6 +3618,10 @@ static void chat(GGUFIndex *ps) {
             /* Zikharon: persistent memory injection */
             if (ZK.loaded)
                 zk_inject(&ZK, lg, ps->host_vocab, is.x, ps->host_dim);
+
+            /* Script filter: suppress Arabic in Hebrew, Korean in German, etc. */
+            apply_script_filter(lg, ps->host_vocab, g_prompt_script,
+                                ps->vocab_tokens, ps->vocab_size);
 
             int next = sample(lg, ps->host_vocab, F.effective_temp, 40);
 
