@@ -317,6 +317,376 @@ typedef struct {
 
 static DarioField DF;
 
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * ZIKHARON (זיכרון) — persistent memory across sessions.
+ *
+ * Three tiers:
+ *   Surface (co-occurrence)  — fast decay 0.90, token-level, Hebbian
+ *   Middle  (episodes)       — medium decay 0.95, session-level, episodic
+ *   Deep    (anchors)        — slow decay 0.998, theme-level, crystallized
+ *
+ * Resurfacing strengthens memory. Decay weakens it. The balance is life.
+ * File format: leo.mem (binary, portable, <1MB)
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+#define ZK_MAGIC           "LEOMEM01"
+#define ZK_VERSION         1
+#define ZK_MAX_COOC        32768
+#define ZK_MAX_ANCHORS     1024
+#define ZK_MAX_EPISODES    512
+#define ZK_TOPIC_DIM       32
+#define ZK_ANCHOR_TOKENS   16
+#define ZK_EPISODE_TOKENS  8
+#define ZK_SESSION_INTERVAL 3600
+
+#define ZK_DECAY_SURFACE   0.90f
+#define ZK_DECAY_MIDDLE    0.95f
+#define ZK_DECAY_DEEP      0.998f
+#define ZK_RESURFACE_BOOST 1.05f
+#define ZK_MAX_COOC_VALUE  5.0f
+
+#define ZK_MEM_ALPHA       0.08f
+#define ZK_MEM_BETA        0.05f
+#define ZK_MEM_GAMMA       0.03f
+
+typedef struct {
+    uint16_t src, dst;
+    float    value;
+    uint16_t age, access;
+} ZkCooc;  /* 12 bytes */
+
+typedef struct {
+    float    topic[ZK_TOPIC_DIM];
+    float    strength;
+    uint8_t  decay_class;
+    uint16_t access_count;
+    uint32_t last_access;
+    uint32_t created;
+    uint16_t tokens[ZK_ANCHOR_TOKENS];
+    uint8_t  _pad[1];
+} ZkAnchor;  /* 176 bytes */
+
+typedef struct {
+    float    summary[ZK_TOPIC_DIM];
+    uint32_t timestamp;
+    uint16_t n_turns;
+    float    avg_entropy;
+    float    avg_resonance;
+    float    peak_emergence;
+    float    strength;
+    float    chambers[DARIO_NUM_CH];
+    uint16_t tokens[ZK_EPISODE_TOKENS];
+    uint8_t  _pad[2];
+} ZkEpisode;  /* 188 bytes */
+
+typedef struct {
+    char     magic[8];
+    uint32_t version;
+    uint32_t n_cooc;
+    uint32_t n_anchors;
+    uint32_t n_episodes;
+    uint32_t last_save;
+    uint32_t total_sessions;
+    uint8_t  _reserved[28];
+} ZkHeader;  /* 64 bytes */
+
+typedef struct {
+    ZkHeader   header;
+    ZkCooc     cooc[ZK_MAX_COOC];
+    int        n_cooc;
+    ZkAnchor   anchors[ZK_MAX_ANCHORS];
+    int        n_anchors;
+    ZkEpisode  episodes[ZK_MAX_EPISODES];
+    int        n_episodes;
+    int        episode_idx;  /* ring buffer write position */
+
+    /* Random projection matrix (640 → 32), generated from seed */
+    float      proj[640 * ZK_TOPIC_DIM];
+    int        proj_dim;  /* host dim, set at init */
+
+    /* Session accumulators */
+    float      sess_topic_sum[ZK_TOPIC_DIM];
+    int        sess_turns;
+    float      sess_entropy_sum;
+    float      sess_resonance_sum;
+    float      sess_peak_emergence;
+
+    int        loaded;
+    char       path[256];
+} Zikharon;
+
+static Zikharon ZK;
+
+/* ── Zikharon helpers ── */
+
+static void zk_init_proj(Zikharon *zk, int host_dim) {
+    zk->proj_dim = host_dim > 640 ? 640 : host_dim;
+    /* Deterministic random projection (seed=42) */
+    uint32_t rng = 42;
+    float scale = 1.0f / sqrtf((float)ZK_TOPIC_DIM);
+    for (int i = 0; i < zk->proj_dim * ZK_TOPIC_DIM; i++) {
+        rng = rng * 1103515245 + 12345;
+        float u = ((float)(rng >> 16) / 32768.0f) - 1.0f;
+        zk->proj[i] = u * scale;
+    }
+}
+
+static void zk_project(Zikharon *zk, const float *hidden, float *topic) {
+    /* topic[32] = proj[32 x dim] @ hidden[dim] */
+    for (int i = 0; i < ZK_TOPIC_DIM; i++) {
+        float s = 0;
+        for (int j = 0; j < zk->proj_dim; j++)
+            s += zk->proj[i * zk->proj_dim + j] * hidden[j];
+        topic[i] = s;
+    }
+    /* L2 normalize */
+    float norm = 0;
+    for (int i = 0; i < ZK_TOPIC_DIM; i++) norm += topic[i] * topic[i];
+    norm = 1.0f / (sqrtf(norm) + 1e-8f);
+    for (int i = 0; i < ZK_TOPIC_DIM; i++) topic[i] *= norm;
+}
+
+static float zk_cosine32(const float *a, const float *b) {
+    float dot = 0, na = 0, nb = 0;
+    for (int i = 0; i < ZK_TOPIC_DIM; i++) {
+        dot += a[i] * b[i]; na += a[i]*a[i]; nb += b[i]*b[i];
+    }
+    return dot / (sqrtf(na * nb) + 1e-8f);
+}
+
+static int zk_load(Zikharon *zk) {
+    FILE *f = fopen(zk->path, "rb");
+    if (!f) {
+        printf("[zikharon] no memory file — fresh start\n");
+        zk->loaded = 1;
+        return 1;
+    }
+    ZkHeader hdr;
+    if (fread(&hdr, sizeof(hdr), 1, f) != 1 || memcmp(hdr.magic, ZK_MAGIC, 8) != 0) {
+        printf("[zikharon] corrupt header — fresh start\n");
+        fclose(f); zk->loaded = 1; return 1;
+    }
+    zk->header = hdr;
+    zk->n_cooc = (int)hdr.n_cooc;
+    zk->n_anchors = (int)hdr.n_anchors;
+    zk->n_episodes = (int)hdr.n_episodes;
+    if (zk->n_cooc > ZK_MAX_COOC) zk->n_cooc = ZK_MAX_COOC;
+    if (zk->n_anchors > ZK_MAX_ANCHORS) zk->n_anchors = ZK_MAX_ANCHORS;
+    if (zk->n_episodes > ZK_MAX_EPISODES) zk->n_episodes = ZK_MAX_EPISODES;
+
+    if (zk->n_cooc > 0) fread(zk->cooc, sizeof(ZkCooc), zk->n_cooc, f);
+    if (zk->n_anchors > 0) fread(zk->anchors, sizeof(ZkAnchor), zk->n_anchors, f);
+    if (zk->n_episodes > 0) fread(zk->episodes, sizeof(ZkEpisode), zk->n_episodes, f);
+    fclose(f);
+
+    /* Apply decay based on elapsed time */
+    uint32_t now = (uint32_t)time(NULL);
+    int gap = (int)((now - hdr.last_save) / ZK_SESSION_INTERVAL);
+    if (gap < 1) gap = 1;
+    if (gap > 1000) gap = 1000;  /* sanity */
+
+    /* Surface decay */
+    for (int i = 0; i < zk->n_cooc; i++) {
+        zk->cooc[i].value *= powf(ZK_DECAY_SURFACE, (float)gap);
+        zk->cooc[i].age += gap;
+    }
+    int w = 0;
+    for (int i = 0; i < zk->n_cooc; i++)
+        if (zk->cooc[i].value > 0.01f) zk->cooc[w++] = zk->cooc[i];
+    int pruned_cooc = zk->n_cooc - w;
+    zk->n_cooc = w;
+
+    /* Middle decay */
+    for (int i = 0; i < zk->n_episodes; i++)
+        zk->episodes[i].strength *= powf(ZK_DECAY_MIDDLE, (float)gap);
+
+    /* Deep decay */
+    w = 0;
+    for (int i = 0; i < zk->n_anchors; i++) {
+        zk->anchors[i].strength *= powf(ZK_DECAY_DEEP, (float)gap);
+        if (zk->anchors[i].strength > 0.01f) zk->anchors[w++] = zk->anchors[i];
+    }
+    int pruned_anchors = zk->n_anchors - w;
+    zk->n_anchors = w;
+
+    printf("[zikharon] loaded: %d cooc, %d anchors, %d episodes (gap=%d sessions, pruned %d cooc %d anchors)\n",
+           zk->n_cooc, zk->n_anchors, zk->n_episodes, gap, pruned_cooc, pruned_anchors);
+    zk->loaded = 1;
+    return 1;
+}
+
+static int zk_save(Zikharon *zk) {
+    if (!zk->loaded) return 0;
+    FILE *f = fopen(zk->path, "wb");
+    if (!f) { printf("[zikharon] cannot write %s\n", zk->path); return 0; }
+
+    ZkHeader hdr;
+    memcpy(hdr.magic, ZK_MAGIC, 8);
+    hdr.version = ZK_VERSION;
+    hdr.n_cooc = zk->n_cooc;
+    hdr.n_anchors = zk->n_anchors;
+    hdr.n_episodes = zk->n_episodes;
+    hdr.last_save = (uint32_t)time(NULL);
+    hdr.total_sessions = zk->header.total_sessions + 1;
+    memset(hdr._reserved, 0, sizeof(hdr._reserved));
+
+    fwrite(&hdr, sizeof(hdr), 1, f);
+    if (zk->n_cooc > 0) fwrite(zk->cooc, sizeof(ZkCooc), zk->n_cooc, f);
+    if (zk->n_anchors > 0) fwrite(zk->anchors, sizeof(ZkAnchor), zk->n_anchors, f);
+    if (zk->n_episodes > 0) fwrite(zk->episodes, sizeof(ZkEpisode), zk->n_episodes, f);
+    fclose(f);
+
+    long sz = sizeof(hdr) + zk->n_cooc * sizeof(ZkCooc) + zk->n_anchors * sizeof(ZkAnchor) + zk->n_episodes * sizeof(ZkEpisode);
+    printf("[zikharon] saved: %d cooc, %d anchors, %d episodes (%ld bytes, session #%d)\n",
+           zk->n_cooc, zk->n_anchors, zk->n_episodes, sz, hdr.total_sessions);
+    return 1;
+}
+
+/* Merge session co-occurrence from DarioField into Zikharon */
+static void zk_merge_cooc(Zikharon *zk) {
+    for (int i = 0; i < DF.cooc_n && zk->n_cooc < ZK_MAX_COOC; i++) {
+        uint16_t src = (uint16_t)(DF.cooc_src[i] % 65536);
+        uint16_t dst = (uint16_t)(DF.cooc_dst[i] % 65536);
+        /* Find existing entry */
+        int found = -1;
+        for (int j = 0; j < zk->n_cooc; j++) {
+            if (zk->cooc[j].src == src && zk->cooc[j].dst == dst) { found = j; break; }
+        }
+        if (found >= 0) {
+            zk->cooc[found].value += DF.cooc_val[i] * 0.3f;
+            if (zk->cooc[found].value > ZK_MAX_COOC_VALUE) zk->cooc[found].value = ZK_MAX_COOC_VALUE;
+            zk->cooc[found].age = 0;
+            zk->cooc[found].access++;
+        } else if (DF.cooc_val[i] > 0.5f) {
+            /* Only persist strong co-occurrences */
+            ZkCooc *c = &zk->cooc[zk->n_cooc++];
+            c->src = src; c->dst = dst;
+            c->value = DF.cooc_val[i] * 0.3f;
+            c->age = 0; c->access = 1;
+        }
+    }
+}
+
+/* Create episode from current session */
+static void zk_create_episode(Zikharon *zk, const float *hidden, int dim) {
+    if (zk->sess_turns == 0) return;
+
+    ZkEpisode *ep;
+    if (zk->n_episodes < ZK_MAX_EPISODES) {
+        ep = &zk->episodes[zk->n_episodes++];
+    } else {
+        /* Ring buffer: overwrite oldest */
+        ep = &zk->episodes[zk->episode_idx % ZK_MAX_EPISODES];
+        zk->episode_idx++;
+    }
+
+    /* Topic from accumulated hidden states */
+    float topic[ZK_TOPIC_DIM];
+    if (hidden && dim > 0) {
+        zk_project(zk, hidden, topic);
+    } else {
+        /* Use accumulated topic sum */
+        float norm = 0;
+        for (int i = 0; i < ZK_TOPIC_DIM; i++) norm += zk->sess_topic_sum[i] * zk->sess_topic_sum[i];
+        norm = 1.0f / (sqrtf(norm) + 1e-8f);
+        for (int i = 0; i < ZK_TOPIC_DIM; i++) topic[i] = zk->sess_topic_sum[i] * norm;
+    }
+
+    memcpy(ep->summary, topic, sizeof(topic));
+    ep->timestamp = (uint32_t)time(NULL);
+    ep->n_turns = (uint16_t)zk->sess_turns;
+    ep->avg_entropy = zk->sess_turns > 0 ? zk->sess_entropy_sum / zk->sess_turns : 0;
+    ep->avg_resonance = zk->sess_turns > 0 ? zk->sess_resonance_sum / zk->sess_turns : 0;
+    ep->peak_emergence = zk->sess_peak_emergence;
+    ep->strength = 1.0f;
+    memcpy(ep->chambers, DF.chamber, sizeof(ep->chambers));
+    memset(ep->tokens, 0, sizeof(ep->tokens));
+}
+
+/* Try to create anchor from high-emergence moment */
+static void zk_maybe_anchor(Zikharon *zk, const float *hidden, int dim, float emergence,
+                              const int *recent_tokens, int n_recent) {
+    if (emergence < 0.7f) return;
+    if (zk->n_anchors >= ZK_MAX_ANCHORS) {
+        /* Evict weakest */
+        int weakest = 0;
+        for (int i = 1; i < zk->n_anchors; i++)
+            if (zk->anchors[i].strength < zk->anchors[weakest].strength) weakest = i;
+        if (zk->anchors[weakest].strength > emergence * 0.5f) return;  /* not worth evicting */
+        zk->anchors[weakest] = zk->anchors[--zk->n_anchors];
+    }
+
+    ZkAnchor *a = &zk->anchors[zk->n_anchors++];
+    zk_project(zk, hidden, a->topic);
+    a->strength = 1.0f;
+    a->decay_class = 2;  /* deep */
+    a->access_count = 0;
+    a->last_access = (uint32_t)time(NULL);
+    a->created = a->last_access;
+    memset(a->tokens, 0, sizeof(a->tokens));
+    int n = n_recent < ZK_ANCHOR_TOKENS ? n_recent : ZK_ANCHOR_TOKENS;
+    for (int i = 0; i < n; i++) a->tokens[i] = (uint16_t)(recent_tokens[i] % 65536);
+}
+
+/* Inject persistent memory into logits */
+static void zk_inject(Zikharon *zk, float *logits, int V,
+                        const float *hidden, int dim) {
+    if (!zk->loaded || V <= 0) return;
+
+    float topic[ZK_TOPIC_DIM];
+    zk_project(zk, hidden, topic);
+
+    /* Accumulate for session topic */
+    for (int i = 0; i < ZK_TOPIC_DIM; i++) zk->sess_topic_sum[i] += topic[i];
+
+    /* ── Surface: co-occurrence from past sessions ── */
+    int ctx_start = (DF.ctx_len > 8) ? DF.ctx_len - 8 : 0;
+    for (int c = ctx_start; c < DF.ctx_len; c++) {
+        uint16_t src = (uint16_t)(DF.context[c] % 65536);
+        for (int i = 0; i < zk->n_cooc; i++) {
+            if (zk->cooc[i].src == src && zk->cooc[i].dst < V) {
+                float recency = 1.0f / (1.0f + 0.1f * zk->cooc[i].age);
+                logits[zk->cooc[i].dst] += ZK_MEM_ALPHA * zk->cooc[i].value * recency;
+                /* Resurfacing */
+                zk->cooc[i].access++;
+                zk->cooc[i].value *= 1.02f;
+                if (zk->cooc[i].value > ZK_MAX_COOC_VALUE) zk->cooc[i].value = ZK_MAX_COOC_VALUE;
+                zk->cooc[i].age = 0;
+            }
+        }
+    }
+
+    /* ── Deep: anchor resonance ── */
+    for (int a = 0; a < zk->n_anchors; a++) {
+        float sim = zk_cosine32(topic, zk->anchors[a].topic);
+        if (sim > 0.5f) {
+            float boost = ZK_MEM_BETA * sim * zk->anchors[a].strength;
+            for (int t = 0; t < ZK_ANCHOR_TOKENS; t++) {
+                int tid = zk->anchors[a].tokens[t];
+                if (tid > 0 && tid < V) logits[tid] += boost;
+            }
+            /* Resurfacing strengthens */
+            zk->anchors[a].access_count++;
+            zk->anchors[a].strength *= ZK_RESURFACE_BOOST;
+            if (zk->anchors[a].strength > 1.0f) zk->anchors[a].strength = 1.0f;
+            zk->anchors[a].last_access = (uint32_t)time(NULL);
+        }
+    }
+
+    /* ── Middle: episode continuity ── */
+    for (int e = 0; e < zk->n_episodes; e++) {
+        if (zk->episodes[e].strength < 0.05f) continue;
+        float sim = zk_cosine32(topic, zk->episodes[e].summary);
+        if (sim > 0.6f) {
+            float boost = ZK_MEM_GAMMA * sim * zk->episodes[e].strength;
+            for (int t = 0; t < ZK_EPISODE_TOKENS; t++) {
+                int tid = zk->episodes[e].tokens[t];
+                if (tid > 0 && tid < V) logits[tid] += boost;
+            }
+        }
+    }
+}
+
 /* ── Dario field helpers ── */
 
 static float dario_clampf(float x, float lo, float hi) {
@@ -2873,12 +3243,168 @@ static int tokenize_input(GGUFIndex *ps, const char *text, int *tokens, int max_
     return out;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * NESHAMA (נשמה) — live background processes.
+ * Trauma watch, overthinking, dream dialog.
+ * Run as pthreads alongside the main chat loop.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    GGUFIndex *ps;
+    InferState *is;
+    volatile int running;
+    volatile int idle_seconds;  /* seconds since last user input */
+    pthread_mutex_t field_lock;
+} Neshama;
+
+static Neshama NESH;
+
+/* Trauma watch: monitors co-occurrence overlap with origin tokens, decays trauma */
+static void *neshama_trauma(void *arg) {
+    Neshama *n = (Neshama *)arg;
+    while (n->running) {
+        usleep(5000000);  /* 5 seconds */
+        pthread_mutex_lock(&n->field_lock);
+        /* Decay trauma toward 0 */
+        DF.trauma *= 0.85f;
+        if (DF.trauma < 0.01f) DF.trauma = 0;
+        /* Check for trauma triggers: high co-occurrence concentration on few tokens */
+        if (DF.cooc_n > 100) {
+            float max_val = 0;
+            for (int i = 0; i < DF.cooc_n; i++)
+                if (DF.cooc_val[i] > max_val) max_val = DF.cooc_val[i];
+            if (max_val > 3.0f) {
+                DF.trauma += 0.1f;
+                if (DF.trauma > 1.0f) DF.trauma = 1.0f;
+            }
+        }
+        pthread_mutex_unlock(&n->field_lock);
+    }
+    return NULL;
+}
+
+/* Overthinking: after each turn, internally processes 3 rings (echo, drift, meta)
+   Generates internal associations and ingests them back into the field */
+static void *neshama_overthink(void *arg) {
+    Neshama *n = (Neshama *)arg;
+    while (n->running) {
+        usleep(3000000);  /* 3 seconds */
+        if (n->idle_seconds < 2) continue;  /* only when idle */
+        pthread_mutex_lock(&n->field_lock);
+        /* Ring 1: Echo — reinforce recent co-occurrences */
+        for (int i = 0; i < DF.cooc_n && i < 50; i++) {
+            DF.cooc_val[i] *= 1.01f;  /* subtle reinforcement */
+            if (DF.cooc_val[i] > 5.0f) DF.cooc_val[i] = 5.0f;
+        }
+        /* Ring 2: Drift — cross-pollinate distant co-occurrences */
+        if (DF.cooc_n > 20) {
+            int a = rand() % DF.cooc_n;
+            int b = rand() % DF.cooc_n;
+            if (DF.cooc_src[a] == DF.cooc_dst[b]) {
+                /* Transitive: if A→B and B→C, weakly create A→C */
+                dario_cooc_update(DF.cooc_src[b], DF.cooc_dst[a], 0.1f);
+            }
+        }
+        /* Ring 3: Meta — prophecy from destiny direction */
+        if (DF.dest_magnitude > 0.5f && DF.prophecy_n < DARIO_MAX_PROPH) {
+            /* Find token closest to destiny vector, create weak prophecy */
+            int best = -1; float best_sim = 0;
+            for (int i = 0; i < 2048; i++) {
+                float *e = dario_get_embed(i);
+                if (!e) continue;
+                float sim = dario_cosine(e, DF.destiny);
+                if (sim > best_sim) { best_sim = sim; best = i; }
+            }
+            if (best >= 0 && best_sim > 0.3f) {
+                DF.prophecy[DF.prophecy_n++] = (DarioProphecy){best, best_sim * 0.3f, 0, 0};
+            }
+        }
+        pthread_mutex_unlock(&n->field_lock);
+    }
+    return NULL;
+}
+
+/* Dream: when idle for 7+ minutes, Leo "thinks" — generates internal dialog */
+static void *neshama_dream(void *arg) {
+    Neshama *n = (Neshama *)arg;
+    while (n->running) {
+        usleep(10000000);  /* check every 10 seconds */
+        if (n->idle_seconds < 420) continue;  /* 7 minutes idle */
+        n->idle_seconds = 0;  /* reset so we don't dream repeatedly */
+
+        pthread_mutex_lock(&n->field_lock);
+        /* Dream: pick random high-strength anchor and let it percolate */
+        if (ZK.n_anchors > 0) {
+            int idx = rand() % ZK.n_anchors;
+            ZkAnchor *a = &ZK.anchors[idx];
+            /* Inject anchor tokens into co-occurrence as if they were said */
+            for (int t = 0; t < ZK_ANCHOR_TOKENS; t++) {
+                if (a->tokens[t] > 0) {
+                    for (int t2 = t + 1; t2 < ZK_ANCHOR_TOKENS && t2 < t + 4; t2++) {
+                        if (a->tokens[t2] > 0)
+                            dario_cooc_update(a->tokens[t], a->tokens[t2], 0.2f);
+                    }
+                }
+            }
+            a->access_count++;
+            a->strength *= ZK_RESURFACE_BOOST;
+            if (a->strength > 1.0f) a->strength = 1.0f;
+            /* Nudge chambers toward the anchor's session chambers */
+            /* (anchor doesn't store chambers, but episodes do) */
+        }
+        /* Nudge destiny toward recent co-occurrence clusters */
+        if (DF.cooc_n > 10) {
+            int strong = 0;
+            for (int i = 1; i < DF.cooc_n; i++)
+                if (DF.cooc_val[i] > DF.cooc_val[strong]) strong = i;
+            float *te = dario_get_embed(DF.cooc_dst[strong]);
+            if (te) {
+                for (int d = 0; d < DARIO_DIM; d++)
+                    DF.destiny[d] = DF.destiny[d] * 0.9f + te[d] * 0.1f;
+            }
+        }
+        pthread_mutex_unlock(&n->field_lock);
+    }
+    return NULL;
+}
+
+static void neshama_start(Neshama *n, GGUFIndex *ps, InferState *is) {
+    n->ps = ps;
+    n->is = is;
+    n->running = 1;
+    n->idle_seconds = 0;
+    pthread_mutex_init(&n->field_lock, NULL);
+
+    pthread_t t1, t2, t3;
+    pthread_create(&t1, NULL, neshama_trauma, n);
+    pthread_create(&t2, NULL, neshama_overthink, n);
+    pthread_create(&t3, NULL, neshama_dream, n);
+    pthread_detach(t1);
+    pthread_detach(t2);
+    pthread_detach(t3);
+    printf("[neshama] 3 threads alive: trauma, overthinking, dream\n");
+}
+
+static void neshama_stop(Neshama *n) {
+    n->running = 0;
+    usleep(100000);  /* let threads exit */
+    pthread_mutex_destroy(&n->field_lock);
+    printf("[neshama] threads dissolved\n");
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * CHAT
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
 static void chat(GGUFIndex *ps) {
     int max_seq = 512;
     InferState is = alloc_infer(ps, max_seq);
     CalendarDrift cd; drift_init(&cd);
     MetaTrack meta; meta_init(&meta);
     HarmonicState hs = {0};
+
+    /* Start Neshama background threads */
+    neshama_start(&NESH, ps, &is);
 
     char input[1024];
     printf("\n[doe] the parliament is in session. type your message (Ctrl+C to dissipate):\n");
@@ -2890,7 +3416,9 @@ static void chat(GGUFIndex *ps) {
 
     while (1) {
         printf("> "); fflush(stdout);
+        NESH.idle_seconds += 1;  /* approximate: fgets blocks, timer threads count real time */
         if (!fgets(input, sizeof(input), stdin)) break;
+        NESH.idle_seconds = 0;  /* user spoke */
         int len = strlen(input);
         while (len > 0 && (input[len-1]=='\n' || input[len-1]=='\r')) input[--len] = '\0';
         if (!len) continue;
@@ -2986,10 +3514,12 @@ static void chat(GGUFIndex *ps) {
             float *lg = doe_forward(ps, &is, prev, pos);
 
             /* Field modulation on logits — Dario Equation */
-            if (!ps->is_gemma) {
-                field_step(1.0f);
-                apply_field_to_logits(lg, ps->host_vocab);
-            }
+            field_step(1.0f);
+            apply_field_to_logits(lg, ps->host_vocab);
+
+            /* Zikharon: persistent memory injection */
+            if (ZK.loaded)
+                zk_inject(&ZK, lg, ps->host_vocab, is.x, ps->host_dim);
 
             int next = sample(lg, ps->host_vocab, F.effective_temp, 40);
 
@@ -3058,7 +3588,9 @@ static void chat(GGUFIndex *ps) {
         if (total_births > 0 || total_deaths > 0)
             printf("  [life] births=%d deaths=%d\n", total_births, total_deaths);
         printf("\n");
+        ZK.sess_turns++;
     }
+    neshama_stop(&NESH);
     free_infer(&is);
 }
 
@@ -3572,6 +4104,11 @@ int main(int argc, char **argv) {
     }
     idx.weightless = weightless;
 
+    /* ── Zikharon: persistent memory ── */
+    snprintf(ZK.path, 256, "%s.mem", gguf_path);
+    zk_init_proj(&ZK, idx.host_dim);
+    zk_load(&ZK);
+
     /* If GGUF has doe.identity metadata — it's ours regardless of filename */
     if (idx.identity_tag[0] != '\0') {
         idx.weightless = 0;
@@ -3610,6 +4147,13 @@ int main(int argc, char **argv) {
         serve_loop(&idx, exe_dir);
     } else {
         chat(&idx);
+    }
+
+    /* ── Zikharon: save memory + merge session co-occurrence ── */
+    if (ZK.loaded) {
+        zk_merge_cooc(&ZK);
+        zk_create_episode(&ZK, NULL, 0);
+        zk_save(&ZK);
     }
 
     /* ── Save spore on exit ── */
