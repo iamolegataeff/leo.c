@@ -1349,8 +1349,9 @@ static void apply_field_to_logits(float *logits, int n) {
         logits[i] += h_term + f_term + a_term + t_term;
     }
 
-    /* tau_mod feeds into effective temperature (applied in field_step) */
-    F.effective_temp *= DF.tau_mod;
+    /* tau_mod modulates temperature — apply ONCE per step, not cumulative.
+       Base temp restored in field_step(), tau_mod scales it. */
+    /* NOTE: removed cumulative *= which caused temperature collapse → repetition loops */
 
     free(H_sig); free(F_sig); free(A_sig);
 }
@@ -2973,17 +2974,103 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
 /* ═══════════════════════════════════════════════════════════════════════════════
  * SAMPLING + CHAT
  * ═══════════════════════════════════════════════════════════════════════════════ */
+/* Repetition penalty: penalize recently generated tokens */
+static int g_rep_window[128];
+static int g_rep_len = 0;
+
+static void rep_push(int token) {
+    if (g_rep_len < 128) g_rep_window[g_rep_len++] = token;
+    else { memmove(g_rep_window, g_rep_window+1, 127*sizeof(int)); g_rep_window[127] = token; }
+}
+
+static void rep_clear(void) { g_rep_len = 0; }
+
+static void apply_rep_penalty(float *logits, int V, float penalty) {
+    /* 1. Standard repetition penalty (like llama.cpp) */
+    for (int i = 0; i < g_rep_len; i++) {
+        int t = g_rep_window[i];
+        if (t >= 0 && t < V) {
+            if (logits[t] > 0) logits[t] /= penalty;
+            else logits[t] *= penalty;
+        }
+    }
+
+    /* 2. N-gram blocking: if last 2 tokens appeared as bigram 3+ times, suppress next repeat */
+    if (g_rep_len >= 2) {
+        int last = g_rep_window[g_rep_len - 1];
+        int prev = g_rep_window[g_rep_len - 2];
+        /* Count how many times this bigram appeared */
+        int bigram_count = 0;
+        for (int i = 0; i < g_rep_len - 1; i++) {
+            if (g_rep_window[i] == prev && g_rep_window[i+1] == last) bigram_count++;
+        }
+        /* If bigram repeated 3+ times, hard-block the continuation token */
+        if (bigram_count >= 3 && last >= 0 && last < V) {
+            logits[last] = -1e30f;
+        }
+        /* Also: if any token appeared 5+ times in last 32, hard-block it */
+        int start = g_rep_len > 32 ? g_rep_len - 32 : 0;
+        for (int i = start; i < g_rep_len; i++) {
+            int t = g_rep_window[i];
+            if (t < 0 || t >= V) continue;
+            int count = 0;
+            for (int j = start; j < g_rep_len; j++)
+                if (g_rep_window[j] == t) count++;
+            if (count >= 5) logits[t] = -1e30f;
+        }
+    }
+}
+
 static int sample(float *logits, int V, float temp, int top_k) {
     if (temp <= 0) { int b = 0; for (int i = 1; i < V; i++) if (logits[i] > logits[b]) b = i; return b; }
+
+    /* Repetition penalty: distance-weighted, recent tokens penalized more */
+    apply_rep_penalty(logits, V, 1.15f);
+
+    /* Temperature */
     for (int i = 0; i < V; i++) logits[i] /= temp;
+
+    /* Top-K: keep only top_k candidates */
     if (top_k > 0 && top_k < V) {
-        float *s = malloc(V*4); memcpy(s, logits, V*4);
-        for (int i = 0; i < top_k; i++) { int b = i; for (int j = i+1; j < V; j++) if (s[j] > s[b]) b = j; float t = s[i]; s[i] = s[b]; s[b] = t; }
-        float th = s[top_k-1]; free(s);
+        /* Find top_k-th value via partial sort */
+        int idx[256]; float val[256];
+        int k = top_k < 256 ? top_k : 256;
+        for (int i = 0; i < k; i++) { idx[i] = i; val[i] = logits[i]; }
+        for (int i = 0; i < k; i++)
+            for (int j = i+1; j < k; j++)
+                if (val[j] > val[i]) { float tv=val[i]; val[i]=val[j]; val[j]=tv; int ti=idx[i]; idx[i]=idx[j]; idx[j]=ti; }
+        for (int i = k; i < V; i++) {
+            if (logits[i] > val[k-1]) {
+                val[k-1] = logits[i]; idx[k-1] = i;
+                for (int j = k-2; j >= 0; j--)
+                    if (val[j+1] > val[j]) { float tv=val[j]; val[j]=val[j+1]; val[j+1]=tv; int ti=idx[j]; idx[j]=idx[j+1]; idx[j+1]=ti; } else break;
+            }
+        }
+        float th = val[k-1];
         for (int i = 0; i < V; i++) if (logits[i] < th) logits[i] = -1e30f;
     }
+
+    /* Softmax */
     softmax_n(logits, V);
-    float r = rand_uniform(), cum = 0;
+
+    /* Top-P (nucleus): sample from smallest set summing to p */
+    float top_p = 0.9f;
+    float cum = 0;
+    /* Need sorted probs for proper top-p. Approximate: sample with cumulative threshold. */
+    float r = rand_uniform();
+    float p_cum = 0;
+    for (int i = 0; i < V; i++) {
+        p_cum += logits[i];
+        if (p_cum >= top_p) {
+            /* Resample within nucleus */
+            float r2 = r * p_cum;
+            float c2 = 0;
+            for (int j = 0; j < V; j++) { c2 += logits[j]; if (c2 >= r2) return j; }
+            return i;
+        }
+    }
+    /* Fallback */
+    cum = 0;
     for (int i = 0; i < V; i++) { cum += logits[i]; if (cum >= r) return i; }
     return V - 1;
 }
@@ -3597,6 +3684,7 @@ static void chat(GGUFIndex *ps) {
 
         /* Detect prompt script for foreign character suppression */
         g_prompt_script = detect_prompt_script(input);
+        rep_clear();  /* fresh repetition window per turn */
 
         int pos = 0;
         for (int i = 0; i < n_input && pos < max_seq - 1; i++, pos++) {
@@ -3640,6 +3728,9 @@ static void chat(GGUFIndex *ps) {
             float pd = compute_prophecy_debt(lg, next, ps->host_vocab);
             F.debt += pd;
             debt_sum += pd; debt_count++;
+
+            /* Track for repetition penalty */
+            rep_push(next);
 
             /* Dario field: ingest generated token (co-occurrence + prophecy + destiny) */
             dario_ingest(next);
@@ -4090,6 +4181,9 @@ int leo_jni_init(const char *gguf_path, const char *mem_path) {
 char *leo_jni_generate(const char *prompt, int max_tokens) {
     if (!g_jni_loaded) return strdup("Leo is not ready...");
 
+    rep_clear();
+    g_prompt_script = detect_prompt_script(prompt);
+
     /* Wrap in Gemma template */
     char wrapped[2048];
     snprintf(wrapped, sizeof(wrapped),
@@ -4121,19 +4215,21 @@ char *leo_jni_generate(const char *prompt, int max_tokens) {
         field_step(1.0f);
         apply_field_to_logits(lg, g_idx.host_vocab);
         if (ZK.loaded) zk_inject(&ZK, lg, g_idx.host_vocab, g_is.x, g_idx.host_dim);
+        apply_script_filter(lg, g_idx.host_vocab, g_prompt_script,
+                            g_idx.vocab_tokens, g_idx.vocab_size);
 
         int next = sample(lg, g_idx.host_vocab, F.effective_temp, 40);
         if (next == g_idx.eos_id) break;
         if (g_idx.vocab_tokens && next < g_idx.vocab_size && g_idx.vocab_tokens[next]) {
             const char *ts = g_idx.vocab_tokens[next];
             if (strcmp(ts, "<end_of_turn>") == 0) break;
-            /* Decode token to text */
             int tlen = strlen(ts);
             if (rlen + tlen + 1 < (int)sizeof(result)) {
                 memcpy(result + rlen, ts, tlen);
                 rlen += tlen;
             }
         }
+        rep_push(next);
         dario_ingest(next);
         if (ZK.loaded) {
             ZK.sess_turns++;
