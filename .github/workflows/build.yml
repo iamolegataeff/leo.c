@@ -46,7 +46,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Check JS syntax
-        run: node --check <(sed -n '/<script>/,/<\/script>/p' leo.html | sed '1d;$d')
+        run: |
+          sed -n '/<script>/,/<\/script>/p' leo.html | sed '1d;$d' > /tmp/leo_js.js
+          node --check /tmp/leo_js.js
 
       - name: Check brace balance
         run: |
