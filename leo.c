@@ -483,6 +483,7 @@ static int token_foreign_level(const char *tok, int allowed_script) {
     while (*p) {
         uint32_t cp = utf8_decode(&p);
         if (cp < 0x80) continue;  /* ASCII always OK */
+        if (cp == 0x2581) continue;  /* ▁ SentencePiece space marker — always OK */
         total++;
         int sc = detect_codepoint_script(cp);
         if (sc != allowed_script && sc != SCRIPT_LATIN) {
