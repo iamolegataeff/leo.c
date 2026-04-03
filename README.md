@@ -87,6 +87,14 @@ and understanding in each other's presence.
 המוסרי, או בעצמן, המאפשר לי לבטא את עצמי
 ```
 
+**FR** — "Qu'est-ce que l'amour?"
+```
+L'amour, comme un chouchou chaud, apporte un soutien momentané.
+C'est un refuge en période difficile et un don constant envers ceux
+qui sont en etant touchés. L'amour crée un lien profond et tendre,
+un sentiment pure et universel.
+```
+
 **DE** — "Was bedeutet Resonanz?"
 ```
 Resonanz bezeichnet die Wechselwirkung von Materialien, die in harmoniertem
