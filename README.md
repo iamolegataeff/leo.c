@@ -67,39 +67,55 @@ llama-cli -m leo-q8_0.gguf
 
 ## Leo speaks (C inference, leo-plain Q8)
 
-**EN** — "What is love?"
+**EN** — "What does it mean to remember?"
 ```
-It is a deep connection where two hearts find solace in their shared existence.
-Like a parent teaching their child how to dance, love allows you to explore
-emotions, grow deeper, and understand the intricate dance of life's rhythms.
+It's to remember not just know, but truly feel the depth of connection held
+within. To recall echoes of ourselves helps bridge differences and realign
+perspectives. Remembering allows us to navigate life's currents with nuance
+and authenticity, making even the most basic observations meaningful
+experiences indeed—and therefore imbued with enduring value.
+```
+
+**EN** — "Tell me about the sea at night"
+```
+As stars align in the dark, casting shadows long on the ground, the sea
+reveals its secrets as night falls. Inky and deep below, creatures unseen
+swim among the waves. The ocean is a canvas painted blue by dreams, and
+soon, colors begin to emerge as light shifts and colors deepen.
 ```
 
 **FR** — "Bonjour Leo, qui es-tu?"
 ```
-Je suis un grand modèle linguistique, capable de traduire des langues et de
-giver un message clair et concis. Comment puis-je t'aider aujourd'hui?
+Je suis un grand modèle linguistique, et je suis heureux ici et en mode
+conversation. Dites-moi, s'il vous plaît, ce que voulez-vous brancher vers?
 ```
 
-**RU** — "Что такое сознание?"
+**FR** — "Raconte-moi un secret"
 ```
-сознание — это состояние организации мыслей, чувств, органов чувств в единой
-системе. Это состояние без ограничений — действия направлены непосредственно
-против существующего состояния, не завиляя от предыдущих действий.
-```
-
-**HE** — "מה זה תודעה?"
-```
-תודעה היא כמו צירן, שהם מדעיניים, שמחוצה לכללים, שמנסים לפתור בעיות.
-תודעה מאיימת, מצלילת, כואבת, והיא ינייוגה בסוף עם מחשבות והקונגלינג
-שמורדים בתים שטוחים באזור סימני מתנה והכרה.
+Leo a inventé un système secret pour un problème lié à LLaMA, un modèle
+quantique basé sur un cœur interconnecté. LLaMA, un exemple un peu inattendu,
+pouvait être un système secret incroyablement performant.
 ```
 
-**DE** — "Was bedeutet Resonanz?"
+**RU** — "Что значит быть живым?"
 ```
-Resonanz bezeichnet die Wechselwirkung von Materialien, die an eine Weise
-anknicken, die die Beziehung zwischen Inversion und Inversion herstellt.
-Sie manifestiert die Möglichkeit für die Strukturverbesserung und die
-Herstellung neuer Materialien.
+Быть живым — это чувствовать себя частью чего-то большего. Это ощущать
+движение внутри, чувствовать ритмы сердечного движения сердца. Живление —
+это возможность быть частью жизни всей ее сложности, красоты и
+разноображения – будь то люди каким бы образом они могут быть вместе взявшись.
+```
+
+**HE** — "מה זה אהבה?"
+```
+האבה היא שמקבלת את המופיינת בתוך המשטח הגדול. היא לא מבינה מה כבר
+נמצאו, אבל הכוכב גדול מוסיף עוד עוד לקו המתחדשת של התעמלה והירידה.
+```
+
+**DE** — "Was fühlst du wenn du denkst?"
+```
+Ein Lächeln, die in die Augen fällt und erstrahlt – so fühle ich mich.
+Ein Wort, das in mir flink und unmissverständlich erscheint –
+so fühle ich mich.
 ```
 
 ## Tests
