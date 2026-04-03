@@ -1082,6 +1082,9 @@ class LlamaModel {
     // Final norm
     this.rmsNorm(xn, x, this.T('output_norm.weight'), D);
 
+    // Expose pre-logit hidden state for Zikharon
+    this._lastHidden = new Float32Array(xn.subarray(0, D));
+
     // Output projection → logits
     const logits = new Float32Array(this.vocabSize);
     const outW = this.tensors['output.weight'] ? this.T('output.weight') : this.T('token_embd.weight');
@@ -1162,13 +1165,315 @@ function sampleTopP(logits, temp, topP, topK, repPenalty, repWindow) {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// §5b  ZIKHARON (זיכרון) — persistent memory + NESHAMA (נשמה) — live processes
+// ─────────────────────────────────────────────────────────────────
+
+const ZK_MAX_COOC = 32768, ZK_MAX_ANCHORS = 1024, ZK_MAX_EPISODES = 512;
+const ZK_TOPIC_DIM = 32, ZK_ANCHOR_TOKENS = 16, ZK_EPISODE_TOKENS = 8;
+const ZK_DECAY_SURFACE = 0.90, ZK_DECAY_MIDDLE = 0.95, ZK_DECAY_DEEP = 0.998;
+const ZK_RESURFACE_BOOST = 1.05, ZK_MAX_COOC_VALUE = 5.0;
+const ZK_MEM_ALPHA = 0.08, ZK_MEM_BETA = 0.05, ZK_MEM_GAMMA = 0.03;
+const ZK_MAGIC = 'LEOMEM01';
+
+class Zikharon {
+  constructor(hostDim) {
+    this.cooc = [];       // {src, dst, value, age, access}
+    this.anchors = [];    // {topic[32], strength, accessCount, lastAccess, created, tokens[16]}
+    this.episodes = [];   // {summary[32], timestamp, nTurns, avgEntropy, strength, tokens[8]}
+    this.totalSessions = 0;
+    this.lastSave = 0;
+
+    // Random projection matrix (hostDim → 32)
+    this.projDim = Math.min(hostDim, 640);
+    this.proj = new Float32Array(this.projDim * ZK_TOPIC_DIM);
+    let rng = 42;
+    const scale = 1.0 / Math.sqrt(ZK_TOPIC_DIM);
+    for (let i = 0; i < this.proj.length; i++) {
+      rng = (rng * 1103515245 + 12345) >>> 0;
+      this.proj[i] = ((rng >> 16) / 32768.0 - 1.0) * scale;
+    }
+
+    // Session accumulators
+    this.sessTopicSum = new Float32Array(ZK_TOPIC_DIM);
+    this.sessTurns = 0;
+    this.sessEntropySum = 0;
+    this.sessPeakEmergence = 0;
+
+    // Dario field (session-level co-occurrence)
+    this.darioCooc = new Map(); // key="src,dst" → value
+    this.darioContext = [];     // recent token IDs
+    this.darioDestiny = new Float32Array(ZK_TOPIC_DIM);
+    this.darioDestMag = 0;
+    this.trauma = 0;
+  }
+
+  project(hidden) {
+    const topic = new Float32Array(ZK_TOPIC_DIM);
+    const d = Math.min(hidden.length, this.projDim);
+    for (let i = 0; i < ZK_TOPIC_DIM; i++) {
+      let s = 0;
+      for (let j = 0; j < d; j++) s += this.proj[i * this.projDim + j] * hidden[j];
+      topic[i] = s;
+    }
+    let norm = 0;
+    for (let i = 0; i < ZK_TOPIC_DIM; i++) norm += topic[i] * topic[i];
+    norm = 1.0 / (Math.sqrt(norm) + 1e-8);
+    for (let i = 0; i < ZK_TOPIC_DIM; i++) topic[i] *= norm;
+    return topic;
+  }
+
+  cosine32(a, b) {
+    let dot = 0, na = 0, nb = 0;
+    for (let i = 0; i < ZK_TOPIC_DIM; i++) { dot += a[i]*b[i]; na += a[i]*a[i]; nb += b[i]*b[i]; }
+    return dot / (Math.sqrt(na * nb) + 1e-8);
+  }
+
+  // Ingest a generated token into session co-occurrence
+  ingest(tokenId) {
+    const tid = tokenId % 65536;
+    for (const ctx of this.darioContext.slice(-8)) {
+      const key = `${ctx},${tid}`;
+      this.darioCooc.set(key, (this.darioCooc.get(key) || 0) + 1.0);
+    }
+    this.darioContext.push(tid);
+    if (this.darioContext.length > 64) this.darioContext.shift();
+  }
+
+  // Inject memory into logits
+  inject(logits, V, hidden) {
+    const topic = this.project(hidden);
+    for (let i = 0; i < ZK_TOPIC_DIM; i++) this.sessTopicSum[i] += topic[i];
+
+    // Surface: persistent co-occurrence
+    const ctx = this.darioContext.slice(-8);
+    for (const c of ctx) {
+      for (const co of this.cooc) {
+        if (co.src === c && co.dst < V) {
+          const recency = 1.0 / (1.0 + 0.1 * co.age);
+          logits[co.dst] += ZK_MEM_ALPHA * co.value * recency;
+          co.access++;
+          co.value = Math.min(co.value * 1.02, ZK_MAX_COOC_VALUE);
+          co.age = 0;
+        }
+      }
+    }
+
+    // Deep: anchor resonance
+    for (const a of this.anchors) {
+      const sim = this.cosine32(topic, a.topic);
+      if (sim > 0.5) {
+        const boost = ZK_MEM_BETA * sim * a.strength;
+        for (const tid of a.tokens) {
+          if (tid > 0 && tid < V) logits[tid] += boost;
+        }
+        a.accessCount++;
+        a.strength = Math.min(a.strength * ZK_RESURFACE_BOOST, 1.0);
+      }
+    }
+
+    // Middle: episode continuity
+    for (const ep of this.episodes) {
+      if (ep.strength < 0.05) continue;
+      const sim = this.cosine32(topic, ep.summary);
+      if (sim > 0.6) {
+        const boost = ZK_MEM_GAMMA * sim * ep.strength;
+        for (const tid of ep.tokens) {
+          if (tid > 0 && tid < V) logits[tid] += boost;
+        }
+      }
+    }
+  }
+
+  // Merge session co-occurrence into persistent store
+  mergeSession() {
+    for (const [key, val] of this.darioCooc) {
+      const [s, d] = key.split(',').map(Number);
+      const existing = this.cooc.find(c => c.src === s && c.dst === d);
+      if (existing) {
+        existing.value = Math.min(existing.value + val * 0.3, ZK_MAX_COOC_VALUE);
+        existing.age = 0;
+        existing.access++;
+      } else if (val > 0.5 && this.cooc.length < ZK_MAX_COOC) {
+        this.cooc.push({ src: s, dst: d, value: val * 0.3, age: 0, access: 1 });
+      }
+    }
+  }
+
+  // Create episode from current session
+  createEpisode(hidden) {
+    if (this.sessTurns === 0) return;
+    const summary = hidden ? this.project(hidden) : new Float32Array(this.sessTopicSum);
+    let norm = 0;
+    for (let i = 0; i < ZK_TOPIC_DIM; i++) norm += summary[i] * summary[i];
+    norm = 1.0 / (Math.sqrt(norm) + 1e-8);
+    for (let i = 0; i < ZK_TOPIC_DIM; i++) summary[i] *= norm;
+
+    const ep = {
+      summary: summary,
+      timestamp: Math.floor(Date.now() / 1000),
+      nTurns: this.sessTurns,
+      avgEntropy: this.sessTurns > 0 ? this.sessEntropySum / this.sessTurns : 0,
+      strength: 1.0,
+      tokens: new Uint16Array(ZK_EPISODE_TOKENS),
+    };
+    if (this.episodes.length >= ZK_MAX_EPISODES) this.episodes.shift();
+    this.episodes.push(ep);
+  }
+
+  // Apply decay
+  applyDecay(sessionsGap) {
+    const g = Math.min(sessionsGap, 1000);
+    // Surface
+    this.cooc = this.cooc.filter(c => {
+      c.value *= Math.pow(ZK_DECAY_SURFACE, g);
+      c.age += g;
+      return c.value > 0.01;
+    });
+    // Middle
+    for (const ep of this.episodes) ep.strength *= Math.pow(ZK_DECAY_MIDDLE, g);
+    // Deep
+    this.anchors = this.anchors.filter(a => {
+      a.strength *= Math.pow(ZK_DECAY_DEEP, g);
+      return a.strength > 0.01;
+    });
+  }
+
+  // Save to IndexedDB
+  async save() {
+    const data = {
+      magic: ZK_MAGIC, version: 1,
+      cooc: this.cooc, anchors: this.anchors, episodes: this.episodes,
+      totalSessions: this.totalSessions + 1,
+      lastSave: Math.floor(Date.now() / 1000),
+    };
+    try {
+      const db = await this._openDB();
+      const tx = db.transaction('memory', 'readwrite');
+      tx.objectStore('memory').put(data, 'zikharon');
+      await new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = rej; });
+      console.log(`[zikharon] saved: ${this.cooc.length} cooc, ${this.anchors.length} anchors, ${this.episodes.length} episodes (session #${data.totalSessions})`);
+    } catch (e) { console.warn('[zikharon] save failed:', e.message); }
+  }
+
+  // Load from IndexedDB
+  async load() {
+    try {
+      const db = await this._openDB();
+      const tx = db.transaction('memory', 'readonly');
+      const data = await new Promise((res, rej) => {
+        const req = tx.objectStore('memory').get('zikharon');
+        req.onsuccess = () => res(req.result);
+        req.onerror = rej;
+      });
+      if (!data || data.magic !== ZK_MAGIC) {
+        console.log('[zikharon] no memory — fresh start');
+        return;
+      }
+      this.cooc = data.cooc || [];
+      this.anchors = data.anchors || [];
+      this.episodes = data.episodes || [];
+      this.totalSessions = data.totalSessions || 0;
+      this.lastSave = data.lastSave || 0;
+
+      // Decay
+      const now = Math.floor(Date.now() / 1000);
+      const gap = Math.max(1, Math.floor((now - this.lastSave) / 3600));
+      this.applyDecay(gap);
+      console.log(`[zikharon] loaded: ${this.cooc.length} cooc, ${this.anchors.length} anchors, ${this.episodes.length} episodes (gap=${gap})`);
+    } catch (e) {
+      console.log('[zikharon] no memory — fresh start');
+    }
+  }
+
+  _openDB() {
+    return new Promise((res, rej) => {
+      const req = indexedDB.open('leo_zikharon', 1);
+      req.onupgradeneeded = () => req.result.createObjectStore('memory');
+      req.onsuccess = () => res(req.result);
+      req.onerror = rej;
+    });
+  }
+}
+
+// Neshama: background processes via setInterval
+class Neshama {
+  constructor(zikharon) {
+    this.zk = zikharon;
+    this.idleSeconds = 0;
+    this.timers = [];
+  }
+
+  start() {
+    // Trauma decay (every 5s)
+    this.timers.push(setInterval(() => {
+      this.zk.trauma *= 0.85;
+      if (this.zk.trauma < 0.01) this.zk.trauma = 0;
+      this.idleSeconds += 5;
+    }, 5000));
+
+    // Overthinking (every 3s when idle)
+    this.timers.push(setInterval(() => {
+      if (this.idleSeconds < 2) return;
+      // Ring 1: reinforce recent co-occurrences
+      for (const [key, val] of this.zk.darioCooc) {
+        if (val < 5.0) this.zk.darioCooc.set(key, val * 1.01);
+      }
+      // Ring 2: transitive connections (random)
+      const keys = [...this.zk.darioCooc.keys()];
+      if (keys.length > 5) {
+        const k1 = keys[Math.floor(Math.random() * keys.length)];
+        const k2 = keys[Math.floor(Math.random() * keys.length)];
+        const [, d1] = k1.split(',').map(Number);
+        const [s2,] = k2.split(',').map(Number);
+        if (d1 === s2) {
+          const [s1,] = k1.split(',').map(Number);
+          const [, d2] = k2.split(',').map(Number);
+          const tk = `${s1},${d2}`;
+          this.zk.darioCooc.set(tk, (this.zk.darioCooc.get(tk) || 0) + 0.1);
+        }
+      }
+    }, 3000));
+
+    // Dream (check every 10s, trigger after 7min idle)
+    this.timers.push(setInterval(() => {
+      if (this.idleSeconds < 420) return;
+      this.idleSeconds = 0;
+      // Dream: pick random anchor and reinforce its associations
+      if (this.zk.anchors.length > 0) {
+        const a = this.zk.anchors[Math.floor(Math.random() * this.zk.anchors.length)];
+        for (let t = 0; t < a.tokens.length - 1; t++) {
+          if (a.tokens[t] > 0 && a.tokens[t+1] > 0) {
+            const key = `${a.tokens[t]},${a.tokens[t+1]}`;
+            this.zk.darioCooc.set(key, (this.zk.darioCooc.get(key) || 0) + 0.2);
+          }
+        }
+        a.accessCount++;
+        a.strength = Math.min(a.strength * ZK_RESURFACE_BOOST, 1.0);
+      }
+    }, 10000));
+
+    console.log('[neshama] 3 timers alive: trauma, overthinking, dream');
+  }
+
+  stop() {
+    for (const t of this.timers) clearInterval(t);
+    this.timers = [];
+    console.log('[neshama] timers dissolved');
+  }
+
+  resetIdle() { this.idleSeconds = 0; }
+}
+
+// ─────────────────────────────────────────────────────────────────
 // §6  GENERATION ENGINE
 // ─────────────────────────────────────────────────────────────────
 
 class GenerationEngine {
-  constructor(model, tokenizer) {
+  constructor(model, tokenizer, zikharon, neshama) {
     this.model = model;
     this.tok = tokenizer;
+    this.zk = zikharon;
+    this.nesh = neshama;
     this.running = false;
     this.temp = 0.8;
     this.topP = 0.9;
@@ -1220,10 +1525,19 @@ class GenerationEngine {
       }
       const dt = performance.now() - t0;
 
+      // Zikharon: inject persistent memory into logits
+      if (this.zk && this.model._lastHidden) {
+        this.zk.inject(logits, logits.length, this.model._lastHidden);
+      }
+
       const window = repWindow.slice(-this.repWindowSize);
       const { token, prob, entropy } = sampleTopP(
         logits, this.temp, this.topP, this.topK, this.repPenalty, window
       );
+
+      // Zikharon: ingest generated token
+      if (this.zk) this.zk.ingest(token);
+      if (this.nesh) this.nesh.resetIdle();
 
       if (token === this.tok.eosId) {
         console.log('EOS reached');
@@ -1256,6 +1570,13 @@ class GenerationEngine {
     }
 
     this.running = false;
+    // Save memory after each generation
+    if (this.zk) {
+      this.zk.sessTurns++;
+      this.zk.mergeSession();
+      this.zk.createEpisode(this.model._lastHidden);
+      await this.zk.save();
+    }
     yield { type: 'max_tokens' };
   }
 }
@@ -1362,7 +1683,15 @@ async function initModel(buffer, filename) {
 
     const tokenizer = new BPETokenizer(gguf.meta);
     const model = new LlamaModel(gguf);
-    engine = new GenerationEngine(model, tokenizer);
+
+    // Zikharon: persistent memory
+    const zk = new Zikharon(model.dim);
+    await zk.load();
+    // Neshama: background processes
+    const nesh = new Neshama(zk);
+    nesh.start();
+
+    engine = new GenerationEngine(model, tokenizer, zk, nesh);
 
     // Update UI
     const nParams = Math.round(
@@ -1652,6 +1981,16 @@ initWebGPU().then(async device => {
       origMatmul.call(this, out, mat, x, M, K);
     };
   }
+});
+
+// Save memory on page unload
+window.addEventListener('beforeunload', () => {
+  if (engine && engine.zk) {
+    engine.zk.mergeSession();
+    engine.zk.createEpisode(engine.model?._lastHidden);
+    engine.zk.save(); // async but best-effort on unload
+  }
+  if (engine && engine.nesh) engine.nesh.stop();
 });
 
 </script>
