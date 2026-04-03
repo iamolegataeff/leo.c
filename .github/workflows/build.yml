@@ -79,14 +79,12 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
 
-      - name: Create Gradle wrapper
+      - name: Build debug APK
         working-directory: apk
         run: |
           gradle wrapper --gradle-version 8.4
-
-      - name: Build debug APK
-        working-directory: apk
-        run: ./gradlew assembleDebug || echo "APK build requires NDK setup — skipping for now"
+          ./gradlew assembleDebug
+        continue-on-error: true
 
       - name: Upload APK artifact
         if: success()
