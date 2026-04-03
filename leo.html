@@ -365,7 +365,7 @@ html, body {
     <button id="file-btn">choose file</button>
     <input type="file" id="file-input" accept=".gguf">
     <div style="display:flex; gap:8px; margin-top:16px; justify-content:center;">
-      <button id="hf-btn" style="font-family:var(--mono);font-size:9px;letter-spacing:0.08em;padding:10px 20px;border:1px solid var(--accent);background:none;color:var(--accent);cursor:pointer;">LOAD FROM HUGGINGFACE</button>
+      <button id="hf-btn" style="font-family:var(--mono);font-size:9px;letter-spacing:0.08em;padding:10px 20px;border:1px solid var(--accent);background:none;color:var(--accent);cursor:pointer;">LOAD LEO-PLAIN FROM HUGGINGFACE</button>
     </div>
     <div class="url-row">
       <input type="text" id="url-input" placeholder="paste .gguf URL">
@@ -1300,7 +1300,7 @@ urlBtn.onclick = () => {
 const hfBtn = document.getElementById('hf-btn');
 if (hfBtn) {
   hfBtn.onclick = () => {
-    const hfUrl = 'https://huggingface.co/ataeff/g/resolve/main/leo-q8_0.gguf';
+    const hfUrl = 'https://huggingface.co/ataeff/g/resolve/main/leo-plain-q8.gguf';
     fetchFromURL(hfUrl);
   };
 }
